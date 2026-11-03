@@ -1,18 +1,4 @@
-
-import requests, time, pandas as pd
-from datetime import datetime
-import os
-
-BASE_URL = "https://api.india.delta.exchange"
-TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("CHAT_ID", "")
-COINS = ["BTCUSD", "ETHUSD"]
-
-def send_telegram(msg):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("No token/chat id")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
     except Exception as e:
@@ -94,3 +80,6 @@ for coin in COINS:
         print(f"Error {coin}: {e}")
 
 print("Done")
+
+
+    
