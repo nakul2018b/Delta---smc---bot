@@ -1,4 +1,3 @@
-
 import requests
 import pandas as pd
 from datetime import datetime
@@ -7,157 +6,173 @@ import os
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-BASE_URLS = [
-    "https://api.india.delta.exchange",
-    "https://api.delta.exchange"
-]
+
+SYMBOLS = ["BTCUSD", "ETHUSD"]
+BINANCE_MAP = {"BTCUSD": "BTCUSDT", "ETHUSD": "ETHUSDT"}
+
+TF_MAP_BINANCE = {
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "1h": "1h",
+    "4h": "4h",
+    "1d": "1d",
+    "1W": "1w"
+}
 
 def send_telegram(msg):
     if not BOT_TOKEN or not CHAT_ID:
-        print("BOT_TOKEN/CHAT_ID missing, skipping telegram")
+        print("Telegram secrets missing")
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+        print(f"Telegram sent: {r.status_code}")
     except Exception as e:
         print(f"Telegram error: {e}")
 
-def get_candles(symbol, resolution, days=10):
-    for base in BASE_URLS:
-        try:
-            url = f"{base}/v2/chart/history"
-            params = {
-                "symbol": symbol,
-                "resolution": resolution,
-                "start": int(time.time()) - 86400*days,
-                "end": int(time.time())
-            }
-            r = requests.get(url, params=params, timeout=20)
-            # print(f"Trying {base} status {r.status_code}")
-            data = r.json()
-            # Delta API returns {"success": True, "result": [...]} or direct list
-            result = None
-            if isinstance(data, dict):
-                if 'result' in data:
-                    result = data['result']
-                elif 'data' in data:
-                    result = data['data']
-                else:
-                    # Sometimes result is inside success
-                    print(f"No result key for {symbol} {resolution} from {base}: keys={list(data.keys())[:5]}")
-                    continue
-            elif isinstance(data, list):
-                result = data
-            else:
-                print(f"Unknown response type for {symbol} {resolution}: {type(data)}")
-                continue
-            
-            if not result:
-                print(f"Empty result for {symbol} {resolution} from {base}")
-                continue
-            
-            df = pd.DataFrame(result)
-            # Normalize columns
-            # Delta returns keys like open, high, low, close, volume, time
-            for c in ['open','high','low','close']:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors='coerce')
-            # Drop NaN
-            df = df.dropna(subset=['open','high','low','close'])
-            if len(df) < 5:
-                print(f"Too few candles for {symbol} {resolution}: {len(df)}")
-                continue
-            return df
-        except Exception as e:
-            print(f"Candle fetch error {symbol} {resolution} from {base}: {e}")
-            continue
-    print(f"All bases failed for {symbol} {resolution}")
-    return None
+def get_candles(symbol, tf, limit=100):
+    bin_sym = BINANCE_MAP.get(symbol, "BTCUSDT")
+    b_tf = TF_MAP_BINANCE.get(tf, "15m")
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": bin_sym, "interval": b_tf, "limit": limit}
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+        if not isinstance(data, list) or len(data) == 0:
+            print(f"No data for {symbol} {tf}: {str(data)[:200]}")
+            return None
+        df = pd.DataFrame(data, columns=["open_time","open","high","low","close","volume","close_time","qav","trades","taker_base","taker_quote","ignore"])
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["volume"] = df["volume"].astype(float)
+        return df
+    except Exception as e:
+        print(f"Error {symbol} {tf}: {e}")
+        return None
 
-def get_daily_weekly_levels():
+def find_order_blocks(df):
+    if df is None or len(df) < 10:
+        return []
+    obs = []
+    for i in range(2, len(df)-2):
+        if df.iloc[i]["close"] > df.iloc[i]["open"] and df.iloc[i+1]["close"] > df.iloc[i]["high"]:
+            obs.append({"type":"bullish","low":df.iloc[i]["low"],"high":df.iloc[i]["high"],"idx":i})
+        if df.iloc[i]["close"] < df.iloc[i]["open"] and df.iloc[i+1]["close"] < df.iloc[i]["low"]:
+            obs.append({"type":"bearish","low":df.iloc[i]["low"],"high":df.iloc[i]["high"],"idx":i})
+    return obs[-5:]
+
+def detect_mss(df):
+    if df is None or len(df) < 20:
+        return {"bull_mss":False,"bear_mss":False}
+    highs = df["high"].rolling(5).max()
+    lows = df["low"].rolling(5).min()
+    last_close = df.iloc[-1]["close"]
+    prev_high = highs.iloc[-6:-1].max() if len(highs) > 6 else 0
+    prev_low = lows.iloc[-6:-1].min() if len(lows) > 6 else 999999
+    bull = last_close > prev_high if prev_high else False
+    bear = last_close < prev_low if prev_low else False
+    return {"bull_mss":bull,"bear_mss":bear}
+
+def detect_fvg(df):
+    if df is None or len(df) < 5:
+        return False
+    for i in range(1, len(df)-1):
+        prev_high = df.iloc[i-1]["high"]
+        prev_low = df.iloc[i-1]["low"]
+        curr_high = df.iloc[i]["high"]
+        curr_low = df.iloc[i]["low"]
+        next_low = df.iloc[i+1]["low"]
+        next_high = df.iloc[i+1]["high"]
+        # bullish FVG: low of next > high of prev
+        if next_low > prev_high:
+            if abs(i - (len(df)-1)) <= 3:
+                return True
+        if next_high < prev_low:
+            if abs(i - (len(df)-1)) <= 3:
+                return True
+    return False
+
+def check_htf_levels():
     levels = []
-    for symbol in ["BTCUSD", "ETHUSD"]:
-        for tf, days in [("1d", 20), ("1w", 60)]:
-            df = get_candles(symbol, tf, days)
-            if df is None or len(df) < 5:
+    for sym in SYMBOLS:
+        for tf in ["1d","1W","4h"]:
+            df = get_candles(sym, tf, 50)
+            if df is None:
                 continue
-            last = df.iloc[-1]
-            levels.append({'symbol': symbol, 'lvl': float(last['high']), 'type': f'{tf.upper()}_OB_HIGH', 'tf': tf})
-            levels.append({'symbol': symbol, 'lvl': float(last['low']), 'type': f'{tf.upper()}_OB_LOW', 'tf': tf})
+            obs = find_order_blocks(df)
+            for ob in obs:
+                levels.append({"symbol":sym,"tf":tf,"type":ob["type"],"low":ob["low"],"high":ob["high"]})
+            time.sleep(0.2)
     return levels
 
-def check_tap_and_sweep(levels, df_4h):
-    if df_4h is None or len(df_4h) == 0:
-        return False, None, None
-    last_4h = df_4h.iloc[-1]
-    for lvl in levels:
-        try:
-            is_tap = (last_4h['low'] <= lvl['lvl'] <= last_4h['high'])
-            if is_tap:
-                if lvl['type'].endswith("HIGH"):
-                    sweep = last_4h['high'] > lvl['lvl']
-                    if sweep:
-                        return True, lvl, "HIGH_SWEEP"
-                else:
-                    sweep = last_4h['low'] < lvl['lvl']
-                    if sweep:
-                        return True, lvl, "LOW_SWEEP"
-        except Exception as e:
-            continue
-    return False, None, None
-
-def check_mss_fvg(df_15m):
-    if df_15m is None or len(df_15m) < 25:
-        return False, False, False
-    recent_high = df_15m.tail(20)['high'].max()
-    recent_low = df_15m.tail(20)['low'].min()
-    close = df_15m.iloc[-1]['close']
-    mss_bull = close > recent_high
-    mss_bear = close < recent_low
-    fvg = False
-    if len(df_15m) >= 3:
-        c1 = df_15m.iloc[-3]
-        c3 = df_15m.iloc[-1]
-        if c1['high'] < c3['low'] or c1['low'] > c3['high']:
-            fvg = True
-    return mss_bull, mss_bear, fvg
-
 def main():
-    print(f"Checking at {datetime.now()}")
-    all_levels = get_daily_weekly_levels()
-    print(f"Loaded {len(all_levels)} HTF levels: {[l['type'] for l in all_levels[:4]]}")
-    
-    for coin in ["BTCUSD", "ETHUSD"]:
-        df_4h = get_candles(coin, "4h", 10)
-        df_15m = get_candles(coin, "15m", 2)
+    print(f"Checking at {datetime.utcnow()} UTC")
+    try:
+        htf_levels = check_htf_levels()
+        print(f"Loaded {len(htf_levels)} HTF levels")
         
-        if df_4h is None or df_15m is None:
-            print(f"{coin}: Data not available, skipping")
-            continue
-        
-        coin_levels = [l for l in all_levels if l['symbol'] == coin]
-        is_tap_sweep, lvl, sweep_type = check_tap_and_sweep(coin_levels, df_4h)
-        mss_bull, mss_bear, fvg = check_mss_fvg(df_15m)
-        
-        price = float(df_15m.iloc[-1]['close'])
-        print(f"{coin} | Tap/Sweep: {is_tap_sweep} {sweep_type} Lvl: {lvl['type'] if lvl else None} | MSS B:{mss_bull} S:{mss_bear} FVG:{fvg} | Price: {price}")
-        
-        if is_tap_sweep and fvg:
-            if mss_bull and lvl and "LOW" in lvl['type']:
-                msg = f"🟢 BUY SIGNAL - {coin}\nHTF: {lvl['type']} {lvl['tf']}\nSweep: {sweep_type}\nPrice: {price}\n15m: MSS Bull + FVG\nTime: {datetime.now()}"
-                send_telegram(msg)
-                print(f"BUY Alert sent for {coin}")
-            elif mss_bear and lvl and "HIGH" in lvl['type']:
-                msg = f"🔴 SELL SIGNAL - {coin}\nHTF: {lvl['type']} {lvl['tf']}\nSweep: {sweep_type}\nPrice: {price}\n15m: MSS Bear + FVG\nTime: {datetime.now()}"
-                send_telegram(msg)
-                print(f"SELL Alert sent for {coin}")
-    
-    print("Done")
+        for symbol in SYMBOLS:
+            df_15 = get_candles(symbol, "15m", 100)
+            df_4h = get_candles(symbol, "4h", 100)
+            
+            if df_15 is None or df_4h is None:
+                print(f"{symbol}: Data not available, skipping")
+                continue
+            
+            price = df_15.iloc[-1]["close"]
+            mss = detect_mss(df_15)
+            fvg = detect_fvg(df_15)
+            
+            # Check if price near HTF level
+            near_bull = False
+            near_bear = False
+            lvl_info = "None"
+            for lvl in htf_levels:
+                if lvl["symbol"] != symbol:
+                    continue
+                if lvl["low"] <= price <= lvl["high"]*1.005 or abs(price-lvl["low"])/price < 0.005 or abs(price-lvl["high"])/price < 0.005:
+                    if lvl["type"] == "bullish":
+                        near_bull = True
+                        lvl_info = f"{lvl['tf']} Bull OB {lvl['low']:.1f}-{lvl['high']:.1f}"
+                    else:
+                        near_bear = True
+                        lvl_info = f"{lvl['tf']} Bear OB {lvl['low']:.1f}-{lvl['high']:.1f}"
+            
+            tap = near_bull or near_bear
+            sweep = mss["bull_mss"] or mss["bear_mss"]
+            
+            print(f"{symbol} | Tap/Sweep: {tap} {lvl_info} | MSS B:{mss['bull_mss']} S:{mss['bear_mss']} FVG:{fvg} | Price: {price:.2f}")
+            
+            signal = None
+            if tap and mss["bull_mss"] and fvg and near_bull:
+                signal = f"\U0001f7e2 BUY {symbol}\nPrice: {price:.2f}\nLevel: {lvl_info}\nMSS: Bullish + FVG\nTime: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+            elif tap and mss["bear_mss"] and fvg and near_bear:
+                signal = f"\U0001f534 SELL {symbol}\nPrice: {price:.2f}\nLevel: {lvl_info}\nMSS: Bearish + FVG\nTime: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+            
+            if signal:
+                print(f"SIGNAL FOUND: {signal}")
+                send_telegram(signal)
+            time.sleep(0.5)
+        print("Done")
+    except Exception as e:
+        print(f"Main error: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
 
 
+
     
 
     
+
+            
+    
+    
+        
+        
